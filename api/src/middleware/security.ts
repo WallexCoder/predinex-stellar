@@ -71,6 +71,22 @@ export class SecuritySanitizer {
   }
 
   /**
+   * Validates that a value is a safe signed-integer string suitable for
+   * direct use with BigInt() (e.g. "1000", "-500", "0").
+   *
+   * Accepts an optional leading sign followed by one or more digits with no
+   * whitespace, decimals, or scientific notation.  Used to pre-validate
+   * collateralDelta / debtDelta deltaAmount fields before the engine's BigInt
+   * constructor runs (issue #1277).
+   */
+  public static isValidBigIntString(value: any): boolean {
+    if (typeof value !== 'string' && typeof value !== 'number') return false;
+    const s = String(value);
+    // No trimming: whitespace padding is invalid (would silently pass through to BigInt).
+    return /^-?\d+$/.test(s);
+  }
+
+  /**
    * Checks for dangerous prototype pollution in JSON bodies.
    */
   public static isSafeJson(body: any): boolean {
