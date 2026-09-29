@@ -5,13 +5,29 @@
  * The `RateLimiter` class below is the counting primitive; the Express
  * wrappers at the bottom of this file apply it to HTTP routes (see #1196).
  * Previously the limiter was exported from the barrel but never mounted.
+ *
+ * Security fixes (see #1276):
+ *  1. clientIdFor now keys on a *validated* identity only — an API key is
+ *     only used as the bucket when it exists in the sharedAuthValidator
+ *     registry.  Unregistered / arbitrary x-api-key values fall through to
+ *     the real socket address so an attacker cannot manufacture unlimited
+ *     buckets by sending random header values.
+ *  2. X-Forwarded-For is no longer trusted directly.  Express' trust-proxy
+ *     setting (configured in app.ts) makes req.ip reliable; we use that
+ *     instead.
+ *  3. RateLimiter now starts a periodic sweep that evicts expired entries so
+ *     the clients map cannot grow without bound for the process lifetime.
  */
 
 import type { NextFunction, Request, Response } from 'express';
+import { sharedAuthValidator } from './auth.js';
 
 export interface RateLimitOptions {
   windowMs: number;
   maxRequests: number;
+  /** How often (ms) to run the sweep that removes expired entries.
+   *  Defaults to the same value as windowMs.  Set to 0 to disable. */
+  sweepIntervalMs?: number;
 }
 
 interface ClientTracker {
@@ -23,10 +39,28 @@ export class RateLimiter {
   private clients = new Map<string, ClientTracker>();
   private windowMs: number;
   private maxRequests: number;
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options?: Partial<RateLimitOptions>) {
     this.windowMs = options?.windowMs ?? 60_000; // 1 minute
     this.maxRequests = options?.maxRequests ?? 100; // 100 req/min
+
+    const sweepIntervalMs = options?.sweepIntervalMs ?? this.windowMs;
+    if (sweepIntervalMs > 0) {
+      // unref() so the timer does not prevent the process from exiting cleanly
+      const timer = setInterval(() => this.sweep(), sweepIntervalMs);
+      if (timer.unref) timer.unref();
+      this.sweepTimer = timer;
+    }
+  }
+
+  /** Remove all entries whose rate-limit window has already expired. */
+  public sweep(now: number = Date.now()): void {
+    for (const [id, tracker] of this.clients) {
+      if (now >= tracker.resetTime) {
+        this.clients.delete(id);
+      }
+    }
   }
 
   public checkLimit(clientId: string, now: number = Date.now()): {
@@ -76,6 +110,14 @@ export class RateLimiter {
       this.clients.clear();
     }
   }
+
+  /** Stop the background sweep timer (useful in tests / graceful shutdown). */
+  public destroy(): void {
+    if (this.sweepTimer !== null) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+  }
 }
 
 /** Shared limiter for general API traffic (100 req/min per client). */
@@ -90,14 +132,29 @@ export const strictRateLimiter = new RateLimiter({
   maxRequests: 20,
 });
 
+/**
+ * Derive a stable, attacker-resistant client identifier.
+ *
+ * Priority:
+ *  1. A *validated* API key (exists in the sharedAuthValidator registry).
+ *     Using an unregistered key is identical to not sending one at all — the
+ *     attacker cannot create unlimited buckets by inventing random strings.
+ *  2. The socket-level IP address as resolved by Express after trust-proxy
+ *     has been applied (set in createApp() in app.ts).  req.ip is used
+ *     directly; we never read X-Forwarded-For ourselves.
+ */
 function clientIdFor(req: Request): string {
+  // Only honour x-api-key when it is a key the validator actually knows about.
   const apiKey = req.headers['x-api-key'];
-  if (typeof apiKey === 'string' && apiKey.length > 0) return `key:${apiKey}`;
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.length > 0) {
-    return `ip:${forwarded.split(',')[0].trim()}`;
+  if (typeof apiKey === 'string' && apiKey.length > 0) {
+    if (sharedAuthValidator.isRegistered(apiKey)) {
+      return `key:${apiKey}`;
+    }
   }
-  return `ip:${req.ip || 'unknown'}`;
+
+  // Fall back to the real IP address (trust-proxy is configured in app.ts so
+  // Express sanitises X-Forwarded-For before exposing it via req.ip).
+  return `ip:${req.ip ?? 'unknown'}`;
 }
 
 /**

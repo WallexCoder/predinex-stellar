@@ -54,6 +54,23 @@ export class AuthValidator {
     return { apiKey, role: 'User' };
   }
 
+  /**
+   * Returns true when the supplied key exists in any registered-key set
+   * (Admin, ComplianceOfficer, or Assessor).  Unregistered keys — including
+   * those belonging to anonymous callers — always return false.
+   *
+   * Used by the rate-limiter to decide whether a presented x-api-key should
+   * define its own rate-limit bucket (registered) or fall through to the
+   * socket-level IP address (unregistered / attacker-controlled).
+   */
+  public isRegistered(apiKey: string): boolean {
+    return (
+      this.adminKeys.has(apiKey) ||
+      this.officerKeys.has(apiKey) ||
+      this.assessorKeys.has(apiKey)
+    );
+  }
+
   public verifySignature(payload: string, signature: string): boolean {
     if (!signature.startsWith('sha256=')) {
       return false;
