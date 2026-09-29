@@ -15,6 +15,21 @@ export const DEFAULT_LIQUIDATION_THRESHOLD_BPS = 8000;
 export const DEFAULT_COLLATERAL_FACTOR_BPS = 7500;
 export const DEFAULT_BORROW_RATE_BPS = 500;
 
+/**
+ * Hard upper bounds on every array accepted by the simulation endpoint.
+ *
+ * The engine applies collateralDeltas and debtDeltas in nested O(n*m) loops
+ * (one scan of simulatedCollaterals / simulatedBorrows per delta entry).
+ * Without a cap a single ~1 MB body can produce 80 M+ iterations and pin the
+ * Node event loop for >10 s (issue #1277).  A few hundred entries is generous
+ * for any legitimate single-user simulation.
+ */
+export const MAX_COLLATERALS = 200;
+export const MAX_BORROWS = 200;
+export const MAX_PRICE_SHOCKS = 200;
+export const MAX_COLLATERAL_DELTAS = 200;
+export const MAX_DEBT_DELTAS = 200;
+
 export class SimulationRouteHandler {
   /**
    * Handles POST /api/simulation/position-health
@@ -40,6 +55,141 @@ export class SimulationRouteHandler {
         },
         timestamp: Date.now(),
       };
+    }
+
+    // ── Array-length caps (issue #1277) ──────────────────────────────────────
+    // All five arrays are processed in synchronous loops (collateralDeltas and
+    // debtDeltas in nested O(n*m) BigInt loops).  Reject oversized inputs
+    // before any loop runs so a single request cannot pin the event loop.
+    if (body.collaterals.length > MAX_COLLATERALS) {
+      return {
+        success: false,
+        error: {
+          code: 'INPUT_TOO_LARGE',
+          message: `collaterals exceeds the maximum of ${MAX_COLLATERALS} entries`,
+        },
+        timestamp: Date.now(),
+      };
+    }
+
+    if (Array.isArray(body.borrows) && body.borrows.length > MAX_BORROWS) {
+      return {
+        success: false,
+        error: {
+          code: 'INPUT_TOO_LARGE',
+          message: `borrows exceeds the maximum of ${MAX_BORROWS} entries`,
+        },
+        timestamp: Date.now(),
+      };
+    }
+
+    if (Array.isArray(body.priceShocks) && body.priceShocks.length > MAX_PRICE_SHOCKS) {
+      return {
+        success: false,
+        error: {
+          code: 'INPUT_TOO_LARGE',
+          message: `priceShocks exceeds the maximum of ${MAX_PRICE_SHOCKS} entries`,
+        },
+        timestamp: Date.now(),
+      };
+    }
+
+    if (Array.isArray(body.collateralDeltas) && body.collateralDeltas.length > MAX_COLLATERAL_DELTAS) {
+      return {
+        success: false,
+        error: {
+          code: 'INPUT_TOO_LARGE',
+          message: `collateralDeltas exceeds the maximum of ${MAX_COLLATERAL_DELTAS} entries`,
+        },
+        timestamp: Date.now(),
+      };
+    }
+
+    if (Array.isArray(body.debtDeltas) && body.debtDeltas.length > MAX_DEBT_DELTAS) {
+      return {
+        success: false,
+        error: {
+          code: 'INPUT_TOO_LARGE',
+          message: `debtDeltas exceeds the maximum of ${MAX_DEBT_DELTAS} entries`,
+        },
+        timestamp: Date.now(),
+      };
+    }
+
+    // ── Per-element validation for delta arrays (issue #1277) ────────────────
+    // collateralDeltas and debtDeltas are passed raw into BigInt() inside the
+    // engine.  Validate each entry's shape and that deltaAmount is a safe
+    // integer string before any engine call.
+    if (Array.isArray(body.collateralDeltas)) {
+      for (let i = 0; i < body.collateralDeltas.length; i++) {
+        const delta = body.collateralDeltas[i];
+        if (!delta || typeof delta !== 'object') {
+          return {
+            success: false,
+            error: {
+              code: 'INVALID_INPUT',
+              message: `collateralDeltas[${i}] must be an object`,
+            },
+            timestamp: Date.now(),
+          };
+        }
+        if (!delta.asset || typeof delta.asset !== 'string' || delta.asset.trim() === '') {
+          return {
+            success: false,
+            error: {
+              code: 'INVALID_INPUT',
+              message: `collateralDeltas[${i}].asset must be a non-empty string`,
+            },
+            timestamp: Date.now(),
+          };
+        }
+        if (!SecuritySanitizer.isValidBigIntString(delta.deltaAmount)) {
+          return {
+            success: false,
+            error: {
+              code: 'INVALID_INPUT',
+              message: `collateralDeltas[${i}].deltaAmount must be an integer string (e.g. "1000" or "-500")`,
+            },
+            timestamp: Date.now(),
+          };
+        }
+      }
+    }
+
+    if (Array.isArray(body.debtDeltas)) {
+      for (let i = 0; i < body.debtDeltas.length; i++) {
+        const delta = body.debtDeltas[i];
+        if (!delta || typeof delta !== 'object') {
+          return {
+            success: false,
+            error: {
+              code: 'INVALID_INPUT',
+              message: `debtDeltas[${i}] must be an object`,
+            },
+            timestamp: Date.now(),
+          };
+        }
+        if (!delta.asset || typeof delta.asset !== 'string' || delta.asset.trim() === '') {
+          return {
+            success: false,
+            error: {
+              code: 'INVALID_INPUT',
+              message: `debtDeltas[${i}].asset must be a non-empty string`,
+            },
+            timestamp: Date.now(),
+          };
+        }
+        if (!SecuritySanitizer.isValidBigIntString(delta.deltaAmount)) {
+          return {
+            success: false,
+            error: {
+              code: 'INVALID_INPUT',
+              message: `debtDeltas[${i}].deltaAmount must be an integer string (e.g. "1000" or "-500")`,
+            },
+            timestamp: Date.now(),
+          };
+        }
+      }
     }
 
     if (!body.borrows || !Array.isArray(body.borrows)) {

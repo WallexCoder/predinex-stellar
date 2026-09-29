@@ -229,3 +229,222 @@ describe('Simulation Engine Extended Coverage', () => {
     expect(res.simulatedHealthFactor).toBeGreaterThan(2.0);
   });
 });
+
+// ── Issue #1277: array-length caps and per-element delta validation ───────────
+
+import {
+  MAX_COLLATERALS,
+  MAX_BORROWS,
+  MAX_PRICE_SHOCKS,
+  MAX_COLLATERAL_DELTAS,
+  MAX_DEBT_DELTAS,
+} from '../src/routes/simulation.js';
+import { SecuritySanitizer } from '../src/middleware/security.js';
+
+const baseCollateral = {
+  asset: 'XLM',
+  amount: '1000',
+  priceUsd: 1,
+  liquidationThresholdBps: 8000,
+  collateralFactorBps: 7500,
+};
+
+describe('#1277 array-length caps', () => {
+  it('accepts exactly MAX_COLLATERALS collaterals', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: Array(MAX_COLLATERALS).fill(baseCollateral),
+    });
+    expect(res.success).toBe(true);
+  });
+
+  it('rejects collaterals above the cap with INPUT_TOO_LARGE', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: Array(MAX_COLLATERALS + 1).fill(baseCollateral),
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INPUT_TOO_LARGE');
+    expect(res.error?.message).toMatch(/collaterals/);
+  });
+
+  it('rejects borrows above the cap with INPUT_TOO_LARGE', () => {
+    const borrow = { asset: 'USDC', borrowedAmount: '100', priceUsd: 1, borrowRateBps: 500 };
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      borrows: Array(MAX_BORROWS + 1).fill(borrow),
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INPUT_TOO_LARGE');
+    expect(res.error?.message).toMatch(/borrows/);
+  });
+
+  it('rejects priceShocks above the cap with INPUT_TOO_LARGE', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      priceShocks: Array(MAX_PRICE_SHOCKS + 1).fill({ asset: 'XLM', shockBps: -1000 }),
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INPUT_TOO_LARGE');
+    expect(res.error?.message).toMatch(/priceShocks/);
+  });
+
+  it('rejects collateralDeltas above the cap with INPUT_TOO_LARGE', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      collateralDeltas: Array(MAX_COLLATERAL_DELTAS + 1).fill({ asset: 'XLM', deltaAmount: '1' }),
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INPUT_TOO_LARGE');
+    expect(res.error?.message).toMatch(/collateralDeltas/);
+  });
+
+  it('rejects debtDeltas above the cap with INPUT_TOO_LARGE', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      debtDeltas: Array(MAX_DEBT_DELTAS + 1).fill({ asset: 'USDC', deltaAmount: '1' }),
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INPUT_TOO_LARGE');
+    expect(res.error?.message).toMatch(/debtDeltas/);
+  });
+
+  it('length check fires before any loop — the cap protects against event-loop blockage', () => {
+    // A 201-entry collateralDeltas against a 200-entry collaterals would be
+    // 40,000 BigInt iterations.  The cap kicks in at validation time so the
+    // engine is never entered.
+    const start = Date.now();
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: Array(MAX_COLLATERALS).fill(baseCollateral),
+      collateralDeltas: Array(MAX_COLLATERAL_DELTAS + 1).fill({ asset: 'XLM', deltaAmount: '1' }),
+    });
+    expect(Date.now() - start).toBeLessThan(50); // well under any loop cost
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INPUT_TOO_LARGE');
+  });
+});
+
+describe('#1277 per-element delta validation', () => {
+  it('rejects a collateralDelta entry that is not an object', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      collateralDeltas: ['not-an-object'],
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INVALID_INPUT');
+    expect(res.error?.message).toMatch(/collateralDeltas\[0\]/);
+  });
+
+  it('rejects a collateralDelta with missing asset', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      collateralDeltas: [{ asset: '', deltaAmount: '100' }],
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INVALID_INPUT');
+    expect(res.error?.message).toMatch(/collateralDeltas\[0\]\.asset/);
+  });
+
+  it('rejects a collateralDelta with invalid deltaAmount', () => {
+    for (const bad of ['1.5', 'abc', '1e5', null, undefined, {}, '']) {
+      const res = SimulationRouteHandler.handleSimulate({
+        collaterals: [baseCollateral],
+        collateralDeltas: [{ asset: 'XLM', deltaAmount: bad }],
+      });
+      expect(res.success, `expected failure for deltaAmount=${String(bad)}`).toBe(false);
+      expect(res.error?.code).toBe('INVALID_INPUT');
+      expect(res.error?.message).toMatch(/collateralDeltas\[0\]\.deltaAmount/);
+    }
+  });
+
+  it('accepts collateralDeltas with valid signed integer strings', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      collateralDeltas: [
+        { asset: 'XLM', deltaAmount: '500' },
+        { asset: 'XLM', deltaAmount: '-200' },
+        { asset: 'XLM', deltaAmount: '0' },
+      ],
+    });
+    expect(res.success).toBe(true);
+  });
+
+  it('rejects a debtDelta entry that is not an object', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      debtDeltas: [42],
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INVALID_INPUT');
+    expect(res.error?.message).toMatch(/debtDeltas\[0\]/);
+  });
+
+  it('rejects a debtDelta with missing asset', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      debtDeltas: [{ deltaAmount: '100' }],
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.code).toBe('INVALID_INPUT');
+    expect(res.error?.message).toMatch(/debtDeltas\[0\]\.asset/);
+  });
+
+  it('rejects a debtDelta with invalid deltaAmount', () => {
+    for (const bad of ['3.14', 'NaN', '0x10', null, [], '']) {
+      const res = SimulationRouteHandler.handleSimulate({
+        collaterals: [baseCollateral],
+        debtDeltas: [{ asset: 'USDC', deltaAmount: bad }],
+      });
+      expect(res.success, `expected failure for debtDelta deltaAmount=${String(bad)}`).toBe(false);
+      expect(res.error?.code).toBe('INVALID_INPUT');
+      expect(res.error?.message).toMatch(/debtDeltas\[0\]\.deltaAmount/);
+    }
+  });
+
+  it('accepts debtDeltas with valid signed integer strings', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      debtDeltas: [
+        { asset: 'USDC', deltaAmount: '1000' },
+        { asset: 'USDC', deltaAmount: '-500' },
+      ],
+    });
+    expect(res.success).toBe(true);
+  });
+
+  it('reports the correct index in the error message for a mid-array invalid entry', () => {
+    const res = SimulationRouteHandler.handleSimulate({
+      collaterals: [baseCollateral],
+      collateralDeltas: [
+        { asset: 'XLM', deltaAmount: '100' },
+        { asset: 'XLM', deltaAmount: '200' },
+        { asset: 'XLM', deltaAmount: 'bad!' }, // index 2
+      ],
+    });
+    expect(res.success).toBe(false);
+    expect(res.error?.message).toMatch(/collateralDeltas\[2\]/);
+  });
+});
+
+describe('#1277 SecuritySanitizer.isValidBigIntString', () => {
+  it('accepts plain positive and zero integer strings', () => {
+    for (const v of ['0', '1', '999', '1000000']) {
+      expect(SecuritySanitizer.isValidBigIntString(v), v).toBe(true);
+    }
+  });
+
+  it('accepts negative integer strings', () => {
+    for (const v of ['-1', '-500', '-1000000']) {
+      expect(SecuritySanitizer.isValidBigIntString(v), v).toBe(true);
+    }
+  });
+
+  it('rejects decimals, scientific notation, whitespace, and non-numeric input', () => {
+    for (const v of ['1.5', '1e5', ' 10', '10 ', '', 'abc', null, undefined, {}, [], '0x1F']) {
+      expect(SecuritySanitizer.isValidBigIntString(v), String(v)).toBe(false);
+    }
+  });
+
+  it('accepts numeric values coerced to string', () => {
+    expect(SecuritySanitizer.isValidBigIntString(100)).toBe(true);
+    expect(SecuritySanitizer.isValidBigIntString(-50)).toBe(true);
+  });
+});
