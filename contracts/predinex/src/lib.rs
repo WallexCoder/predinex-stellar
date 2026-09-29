@@ -6915,7 +6915,8 @@ impl PredinexContract {
         };
 
         for i in 0..cap {
-            let pool_id = pool_ids.get(i).ok_or(ContractError::PoolNotFound)?;
+            // i < cap <= total, so get(i) is always Some.
+            let pool_id = pool_ids.get(i).unwrap();
 
             // Skip multi-asset pools — callers must use claim_multi_asset_winnings.
             if env
@@ -10277,6 +10278,21 @@ impl PredinexContract {
                     .ok_or(ContractError::PoolTotalOverflow)?;
             } else if is_main_token {
                 if let Some(pool) = env.storage().persistent().get::<_, Pool>(&DataKey::Pool(pid)) {
+                    // #1273 — A pool with status Cancelled but a
+                    // PoolExpiredRefundCursor still present is mid-sweep:
+                    // not all bettors have been refunded yet.  The liability
+                    // cannot be computed reliably from total_a/total_b alone
+                    // (creator deposit is not reflected there).  Block rescue
+                    // entirely until the sweep completes and the cursor is gone.
+                    if pool.status == PoolStatus::Cancelled
+                        && env
+                            .storage()
+                            .persistent()
+                            .has(&DataKey::PoolExpiredRefundCursor(pid))
+                    {
+                        return Err(ContractError::InsufficientTreasuryBalance);
+                    }
+
                     if pool.status != PoolStatus::Cancelled {
                         let total_bets = pool
                             .total_a
