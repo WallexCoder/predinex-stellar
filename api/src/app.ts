@@ -57,6 +57,13 @@ export function createApp(): Express {
   const app = express();
 
   app.disable('x-powered-by');
+
+  // Trust exactly one upstream proxy hop (load balancer / reverse proxy).
+  // This makes Express sanitise X-Forwarded-For and expose a reliable value
+  // via req.ip instead of trusting the raw, attacker-controlled header.
+  // See #1276: without this setting req.ip falls back to the raw header value.
+  app.set('trust proxy', 1);
+
   app.use(helmet());
 
   // 1. Install CORS middleware ahead of all routes (explicit allowlist, no '*').
